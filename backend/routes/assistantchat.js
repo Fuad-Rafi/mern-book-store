@@ -8,6 +8,8 @@ import { createRateLimiter } from '../middleware/rateLimit.js';
 import { generateAssistantReply, reformulateQuery } from '../services/llmService.js';
 import { classifyQueryIntent, retrieveRelevantBooks } from '../services/ragRetriever.js';
 import {
+  RAG_RELEVANCE_THRESHOLD,
+  RAG_SEMANTIC_FLOOR,
   RATE_LIMIT_ASSISTANT_CHAT_PER_MINUTE,
   RATE_LIMIT_ASSISTANT_FEEDBACK_PER_MINUTE,
 } from '../config.js';
@@ -120,7 +122,8 @@ router.post('/chat', authenticateToken, requireRole('customer'), assistantChatRa
     let retrievedContext = {
       query: rawMessage,
       constraints: {},
-      relevanceThreshold: Number(process.env.RAG_RELEVANCE_THRESHOLD ?? 0.35),
+      relevanceThreshold: RAG_RELEVANCE_THRESHOLD,
+      semanticFloor: RAG_SEMANTIC_FLOOR,
       retrievedCount: 0,
     };
 
@@ -137,6 +140,7 @@ router.post('/chat', authenticateToken, requireRole('customer'), assistantChatRa
         query: retrieval.query,
         constraints: retrieval.constraints,
         relevanceThreshold: retrieval.relevanceThreshold,
+        semanticFloor: retrieval.semanticFloor,
         retrievedCount: retrieval.retrievedBooks.length,
       };
 

@@ -8,6 +8,23 @@ const DEFAULT_WEIGHTS = {
   feedbackMatch: Number(process.env.REC_FEEDBACK_WEIGHT ?? 2.1),
   feedbackPenalty: Number(process.env.REC_FEEDBACK_PENALTY_WEIGHT ?? 3.3),
   semanticMatch: Number(process.env.REC_SEMANTIC_WEIGHT ?? 2.5),
+  authorMatch: Number(process.env.REC_AUTHOR_WEIGHT ?? 2.5),
+};
+
+// Sum of every positive weight. Used to map the raw composite score onto 0..1
+// so that a relevance threshold means something. Penalties are not included:
+// they can only push the score down, and the result is clamped at 0.
+export const computeMaxScore = (weights = DEFAULT_WEIGHTS) => {
+  return (
+    weights.queryMatch
+    + weights.popularityPrior
+    + weights.diversityBoost
+    + weights.preferenceMatch
+    + weights.historyMatch
+    + weights.feedbackMatch
+    + weights.semanticMatch
+    + weights.authorMatch
+  );
 };
 
 // Inline cosine similarity (to avoid circular dependency with embeddingService)
@@ -211,13 +228,20 @@ export const buildCandidateScore = ({
     + weights.historyMatch * historyMatch
     + weights.feedbackMatch * feedbackMatch
     + weights.semanticMatch * semanticMatch
-    + 2.5 * authorMatch  // High weight for explicit author preference
+    + weights.authorMatch * authorMatch  // High weight for explicit author preference
     - weights.dislikePenalty * dislikePenalty
     - weights.feedbackPenalty * feedbackPenalty
   );
 
+  // 0..1 view of the same score, so callers can apply a meaningful cutoff.
+  const maxScore = computeMaxScore(weights);
+  const normalizedScore = maxScore > 0
+    ? Math.max(0, Math.min(1, score / maxScore))
+    : 0;
+
   return {
     score,
+    normalizedScore,
     breakdown: {
       queryMatch,
       semanticMatch,
@@ -340,7 +364,7 @@ export const rankBooks = ({
   const genreCounts = buildGenreCounts(books);
 
   const scoredBooks = books.map((book) => {
-    const { score, breakdown } = buildCandidateScore({
+    const { score, normalizedScore, breakdown } = buildCandidateScore({
       book,
       queryTokens,
       query,
@@ -354,6 +378,7 @@ export const rankBooks = ({
     return {
       book,
       score,
+      normalizedScore,
       breakdown,
     };
   });

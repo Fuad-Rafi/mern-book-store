@@ -5,10 +5,16 @@ import { getUnifiedVectorSearch } from './vectorSearchService.js';
 import { extractPreferenceSignals } from './memoryService.js';
 import User from '../models/usermodel.js';
 import { rankBooks, buildHistorySignals } from '../utils/recommendationScoring.js';
+import { RAG_RELEVANCE_THRESHOLD, RAG_SEMANTIC_FLOOR } from '../config.js';
 
-// Safety-net threshold — only filters out completely irrelevant noise.
-// Intentionally very low since we rely on ranking, not hard cutoffs.
-const DEFAULT_RELEVANCE_THRESHOLD = Number(process.env.RAG_RELEVANCE_THRESHOLD ?? 0.1);
+// Two distinct cutoffs, both on a 0..1 scale:
+//  - SEMANTIC_FLOOR runs on raw cosine similarity BEFORE ranking. This is the
+//    real noise filter: it drops books the embedding says are unrelated.
+//  - RELEVANCE_THRESHOLD runs on the normalised composite score AFTER ranking.
+// Previously a single threshold was compared against the unbounded composite
+// score, which made it a no-op (any rated book already scored ~0.9).
+const SEMANTIC_FLOOR = RAG_SEMANTIC_FLOOR;
+const DEFAULT_RELEVANCE_THRESHOLD = RAG_RELEVANCE_THRESHOLD;
 
 const isFiniteNumber = (value) => Number.isFinite(value);
 
@@ -52,7 +58,8 @@ const searchByAuthor = async (preferredAuthors, budgetMin, budgetMax, excludeBoo
     author: { $regex: name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' },
   }));
 
-  const query = { $or: orClauses };
+  // Never surface unpublished/draft books to customers.
+  const query = { $or: orClauses, isPublished: true };
 
   const priceQuery = buildPriceQuery(budgetMin, budgetMax);
   if (priceQuery) query.price = priceQuery;
@@ -88,7 +95,8 @@ const searchByKeyword = async (query, budgetMin, budgetMax, excludeBookIds, limi
     searchText: { $regex: kw, $options: 'i' },
   }));
 
-  const mongoQuery = { $or: regexPatterns };
+  // Never surface unpublished/draft books to customers.
+  const mongoQuery = { $or: regexPatterns, isPublished: true };
   const priceQuery = buildPriceQuery(budgetMin, budgetMax);
   if (priceQuery) mongoQuery.price = priceQuery;
 
@@ -131,8 +139,9 @@ const mergeDeduped = (priority = [], secondary = []) => {
  *  2. If specific author(s) detected → direct MongoDB author search (guaranteed recall).
  *  3. Always run semantic vector search in parallel (for conceptual matching).
  *  4. Merge: author matches first, then semantic results (deduped).
- *  5. If still empty → keyword fallback on searchText field.
- *  6. Apply a very low relevance threshold to filter noise.
+ *  5. Drop anything below the cosine semantic floor (author matches exempt).
+ *  6. If nothing survived → keyword fallback on searchText field.
+ *  7. Rank, then filter on the normalised composite score.
  */
 export const retrieveRelevantBooks = async ({
   userId,
@@ -144,6 +153,7 @@ export const retrieveRelevantBooks = async ({
     return {
       query,
       relevanceThreshold: DEFAULT_RELEVANCE_THRESHOLD,
+      semanticFloor: SEMANTIC_FLOOR,
       retrievedBooks: [],
       constraints: {},
     };
@@ -196,7 +206,14 @@ export const retrieveRelevantBooks = async ({
 
   let merged = mergeDeduped(authorWithScores, semanticWithScores);
 
-  // ── Step 4: Keyword fallback if empty ─────────────────────────────────
+  // ── Step 4: Semantic floor — the actual noise filter ──────────────────
+  // Runs on raw cosine similarity, before ranking. Author matches bypass it:
+  // the user named the author explicitly, so recall beats similarity there.
+  merged = merged.filter(
+    (book) => book.isAuthorMatch || Number(book.semanticScore ?? 0) >= SEMANTIC_FLOOR
+  );
+
+  // ── Step 5: Keyword fallback if nothing survived ──────────────────────
   let candidates = merged;
   if (candidates.length === 0) {
     const keywordResults = await searchByKeyword(query, budgetMin, budgetMax, excludeBookIds, limit);
@@ -206,7 +223,7 @@ export const retrieveRelevantBooks = async ({
     }));
   }
 
-  // ── Step 5: Personalized recommendation scoring ────────────────────────
+  // ── Step 6: Personalized recommendation scoring ────────────────────────
   let finalBooks = candidates;
   if (candidates.length > 0) {
     const historySignals = buildHistorySignals(orders, candidates, user?.feedbackProfile || {});
@@ -228,17 +245,27 @@ export const retrieveRelevantBooks = async ({
       limit,
     });
     
-    finalBooks = ranked
-      .filter(r => r.score >= DEFAULT_RELEVANCE_THRESHOLD)
-      .map(r => ({
-        ...r.book,
-        relevanceScore: Math.max(r.score, r.book.relevanceScore || 0),
-      }));
+    const toBook = (r) => ({
+      ...r.book,
+      // Normalised 0..1, same scale as the semantic floor, so the number the
+      // client and the LLM prompt see is actually interpretable.
+      relevanceScore: r.normalizedScore,
+    });
+
+    const aboveThreshold = ranked.filter((r) => r.normalizedScore >= DEFAULT_RELEVANCE_THRESHOLD);
+
+    // Every candidate already cleared the semantic floor, so if the composite
+    // threshold rejects all of them, keep the single best rather than telling
+    // the user we found nothing.
+    finalBooks = aboveThreshold.length > 0
+      ? aboveThreshold.map(toBook)
+      : ranked.slice(0, 1).map(toBook);
   }
 
   return {
     query,
     relevanceThreshold: DEFAULT_RELEVANCE_THRESHOLD,
+    semanticFloor: SEMANTIC_FLOOR,
     constraints: {
       preferredGenres,
       dislikedGenres: constraints.dislikedGenres || [],

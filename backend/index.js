@@ -6,13 +6,17 @@ import orderRoutes from './routes/orderroutes.js';
 import recommendationRoutes from './routes/bookrecommendations.js';
 import assistantChatRoutes from './routes/assistantchat.js';
 import seedRoutes from './routes/seedroutes.js';
-import { mongoDBURL, PORT, validateEnvironment } from './config.js';
+import { mongoDBURL, PORT, TRUST_PROXY, validateEnvironment } from './config.js';
 import { safeLogError } from './utils/securityLogger.js';
 import cors from 'cors';
 
 const app = express();
 
 validateEnvironment();
+
+// Controls whether Express derives req.ip from X-Forwarded-For. Off by default
+// so the rate limiter cannot be bypassed by spoofing that header.
+app.set('trust proxy', TRUST_PROXY ? 1 : false);
 
 const localOrigins = ['http://localhost:3000', 'http://localhost:3002', 'http://localhost:5000'];
 const envOrigins = process.env.CORS_ORIGIN

@@ -15,7 +15,7 @@ router.get('/', authenticateToken, requireRole('customer'), async (req, res) => 
 
     const [user, books, orders] = await Promise.all([
       User.findById(req.user.id).lean(),
-      Book.find({}).lean(),
+      Book.find({ isPublished: true }).lean(),
       Order.find({ customerId: req.user.id }).lean(),
     ]);
 

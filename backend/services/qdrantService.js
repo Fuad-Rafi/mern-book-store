@@ -56,7 +56,6 @@ export const ensureQdrantCollection = async () => {
   try {
     await qdrant.getCollection(QDRANT_COLLECTION);
     collectionReady = true;
-    return true;
   } catch {
     await qdrant.createCollection(QDRANT_COLLECTION, {
       vectors: {
@@ -65,9 +64,45 @@ export const ensureQdrantCollection = async () => {
       },
     });
     collectionReady = true;
-    return true;
   }
+
+  await ensurePayloadIndexes(qdrant);
+  return true;
 };
+
+// mongoId and isPublished are filtered on every search and every delete, so they
+// need payload indexes. Creating an existing index is a no-op error we ignore.
+const PAYLOAD_INDEXES = [
+  ['mongoId', 'keyword'],
+  ['isPublished', 'bool'],
+  ['price', 'float'],
+];
+
+let payloadIndexesReady = false;
+
+const ensurePayloadIndexes = async (qdrant) => {
+  if (payloadIndexesReady) {
+    return;
+  }
+
+  for (const [field_name, field_schema] of PAYLOAD_INDEXES) {
+    try {
+      await qdrant.createPayloadIndex(QDRANT_COLLECTION, {
+        field_name,
+        field_schema,
+        wait: true,
+      });
+    } catch {
+      // Index already exists, or the server rejected a duplicate. Both are fine.
+    }
+  }
+
+  payloadIndexesReady = true;
+};
+
+const byMongoId = (bookId) => ({
+  must: [{ key: 'mongoId', match: { value: String(bookId) } }],
+});
 
 const toBookPayload = (book = {}) => ({
   mongoId: String(book._id || ''),
@@ -121,9 +156,22 @@ export const upsertBookPoint = async (book = {}) => {
 
   if (points.length === 0) return false;
 
+  // Write first (wait, so the delete below cannot race it)...
   await qdrant.upsert(QDRANT_COLLECTION, {
-    wait: false,
+    wait: true,
     points,
+  });
+
+  // ...then drop every other point still carrying this mongoId. Without this,
+  // a book that used to be indexed as N chunks and is now indexed as 1 (or as
+  // fewer chunks) leaves orphans behind holding stale vectors and stale payload
+  // — including a stale price, which the range filter would then match on.
+  await qdrant.delete(QDRANT_COLLECTION, {
+    wait: false,
+    filter: {
+      ...byMongoId(book._id),
+      must_not: [{ has_id: points.map((point) => point.id) }],
+    },
   });
 
   return true;
@@ -131,16 +179,28 @@ export const upsertBookPoint = async (book = {}) => {
 
 export const deleteBookPoint = async (bookId) => {
   const qdrant = getClient();
-  const pointId = toQdrantPointId(bookId);
-  if (!qdrant || !pointId) {
+  if (!qdrant || !String(bookId || '').trim()) {
     return false;
   }
 
   await ensureQdrantCollection();
+
+  // Delete by payload, not by point id: a book may be stored as many chunk
+  // points (`<id>_chunk0..N`), and deleting only toQdrantPointId(bookId) left
+  // all of those behind.
   await qdrant.delete(QDRANT_COLLECTION, {
-    wait: false,
-    points: [pointId],
+    wait: true,
+    filter: byMongoId(bookId),
   });
+
+  // Belt and braces for any legacy point written without a mongoId payload.
+  const pointId = toQdrantPointId(bookId);
+  if (pointId) {
+    await qdrant.delete(QDRANT_COLLECTION, {
+      wait: false,
+      points: [pointId],
+    });
+  }
 
   return true;
 };
@@ -158,12 +218,14 @@ export const resetQdrantCollection = async () => {
   }
 
   collectionReady = false;
+  payloadIndexesReady = false;
   await ensureQdrantCollection();
   return true;
 };
 
 const buildQdrantFilter = (filters = {}) => {
-  const must = [];
+  // Unpublished books must never reach a customer-facing search.
+  const must = [{ key: 'isPublished', match: { value: true } }];
 
   // Remove hard genre filter from vector search to allow semantic discovery.
   // We will instead BOOST genre matches during the ranking phase.
@@ -183,10 +245,6 @@ const buildQdrantFilter = (filters = {}) => {
       key: 'price',
       range,
     });
-  }
-
-  if (!must.length) {
-    return undefined;
   }
 
   return { must };

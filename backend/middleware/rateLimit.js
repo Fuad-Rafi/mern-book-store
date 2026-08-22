@@ -2,12 +2,26 @@ const store = new Map();
 
 const nowMs = () => Date.now();
 
+/**
+ * Rate-limit key.
+ *
+ * Authenticated requests are keyed on the user id. This matters: the previous
+ * implementation read `x-forwarded-for` directly, a client-controlled header,
+ * so anyone could randomise it and send unlimited requests to the LLM-backed
+ * assistant routes.
+ *
+ * Anonymous requests fall back to req.ip. Express only derives req.ip from
+ * X-Forwarded-For when `trust proxy` is enabled, which index.js gates behind
+ * the TRUST_PROXY env var — so the header is honoured only where a proxy we
+ * control is actually in front of the app.
+ */
 const defaultKey = (req) => {
-  const forwardedFor = req.headers['x-forwarded-for'];
-  if (typeof forwardedFor === 'string' && forwardedFor.trim()) {
-    return forwardedFor.split(',')[0].trim();
+  const userId = req.user?.id;
+  if (userId) {
+    return `user:${userId}`;
   }
-  return req.ip || 'unknown-ip';
+
+  return `ip:${req.ip || 'unknown-ip'}`;
 };
 
 const cleanupExpiredEntries = () => {

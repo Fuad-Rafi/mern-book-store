@@ -7,7 +7,7 @@ import { getUnifiedVectorSearch } from './vectorSearchService.js';
 export const getRankedRecommendations = async ({ userId, query = '', queryEmbedding, limit = 5, mergedMemoryProfile = {} }) => {
   const [user, books, orders] = await Promise.all([
     User.findById(userId).lean(),
-    Book.find({}).lean(),
+    Book.find({ isPublished: true }).lean(),
     Order.find({ customerId: userId }).lean(),
   ]);
 

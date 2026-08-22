@@ -17,8 +17,21 @@ export const RATE_LIMIT_ASSISTANT_CHAT_PER_MINUTE = Number(process.env.RATE_LIMI
 export const RATE_LIMIT_ASSISTANT_FEEDBACK_PER_MINUTE = Number(process.env.RATE_LIMIT_ASSISTANT_FEEDBACK_PER_MINUTE || 40);
 export const RATE_LIMIT_AUTH_LOGIN_PER_MINUTE = Number(process.env.RATE_LIMIT_AUTH_LOGIN_PER_MINUTE || 20);
 
+// Only enable when a proxy you control (Vercel, nginx, a load balancer) sits in
+// front of the app. With it off, Express ignores X-Forwarded-For, so a client
+// cannot spoof its way past the IP-keyed rate limit.
+export const TRUST_PROXY = String(process.env.TRUST_PROXY || (process.env.VERCEL === '1' ? '1' : '')).trim().startsWith('1');
+
 // Embedding configuration
 export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2';
+
+// Retrieval configuration.
+// RAG_SEMANTIC_FLOOR is a cosine-similarity cutoff (0..1) applied to candidates
+// BEFORE ranking. It is the real noise filter.
+// RAG_RELEVANCE_THRESHOLD is a normalised (0..1) cutoff on the final composite
+// ranking score, applied AFTER ranking.
+export const RAG_SEMANTIC_FLOOR = Number(process.env.RAG_SEMANTIC_FLOOR ?? 0.28);
+export const RAG_RELEVANCE_THRESHOLD = Number(process.env.RAG_RELEVANCE_THRESHOLD ?? 0.12);
 export const REC_SEMANTIC_WEIGHT = Number(process.env.REC_SEMANTIC_WEIGHT || 2.5);
 export const ENABLE_EMBEDDING_ON_WRITE = String(
 	process.env.ENABLE_EMBEDDING_ON_WRITE || (isProduction ? '0' : '1')
@@ -70,6 +83,17 @@ export const validateEnvironment = () => {
 	for (const [name, value] of numericLimits) {
 		if (!Number.isFinite(value) || value <= 0) {
 			throw new Error(`${name} must be a positive number`);
+		}
+	}
+
+	const unitIntervalLimits = [
+		['RAG_SEMANTIC_FLOOR', RAG_SEMANTIC_FLOOR],
+		['RAG_RELEVANCE_THRESHOLD', RAG_RELEVANCE_THRESHOLD],
+	];
+
+	for (const [name, value] of unitIntervalLimits) {
+		if (!Number.isFinite(value) || value < 0 || value >= 1) {
+			throw new Error(`${name} must be a number in [0, 1)`);
 		}
 	}
 };

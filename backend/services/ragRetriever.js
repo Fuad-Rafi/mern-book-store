@@ -16,6 +16,11 @@ import { RAG_RELEVANCE_THRESHOLD, RAG_SEMANTIC_FLOOR } from '../config.js';
 const SEMANTIC_FLOOR = RAG_SEMANTIC_FLOOR;
 const DEFAULT_RELEVANCE_THRESHOLD = RAG_RELEVANCE_THRESHOLD;
 
+// Chunk vectors are only needed by the indexer; loading them into every
+// retrieval query would pull N x 384 floats per book for nothing.
+const WITHOUT_CHUNK_VECTORS = '-chunkEmbeddings';
+const AUTHOR_SEARCH_LIMIT = 20;
+
 const isFiniteNumber = (value) => Number.isFinite(value);
 
 export const classifyQueryIntent = (userQuery = '') => {
@@ -64,7 +69,12 @@ const searchByAuthor = async (preferredAuthors, budgetMin, budgetMax, excludeBoo
   const priceQuery = buildPriceQuery(budgetMin, budgetMax);
   if (priceQuery) query.price = priceQuery;
 
-  const books = await Book.find(query).lean();
+  // Capped: a loose author match (a common surname, or a bad extraction) used to
+  // pull the entire catalogue in at a fixed 0.92, outranking real matches.
+  const books = await Book.find(query)
+    .select(WITHOUT_CHUNK_VECTORS)
+    .limit(AUTHOR_SEARCH_LIMIT)
+    .lean();
 
   return books
     .filter((book) => !excludeBookIds.has(String(book._id)))
@@ -100,7 +110,7 @@ const searchByKeyword = async (query, budgetMin, budgetMax, excludeBookIds, limi
   const priceQuery = buildPriceQuery(budgetMin, budgetMax);
   if (priceQuery) mongoQuery.price = priceQuery;
 
-  const books = await Book.find(mongoQuery).limit(limit * 3).lean();
+  const books = await Book.find(mongoQuery).select(WITHOUT_CHUNK_VECTORS).limit(limit * 3).lean();
 
   return books
     .filter((book) => !excludeBookIds.has(String(book._id)))
@@ -141,12 +151,15 @@ const mergeDeduped = (priority = [], secondary = []) => {
  *  4. Merge: author matches first, then semantic results (deduped).
  *  5. Drop anything below the cosine semantic floor (author matches exempt).
  *  6. If nothing survived → keyword fallback on searchText field.
- *  7. Rank, then filter on the normalised composite score.
+ *  7. If a budget emptied the pool, retry unpriced and flag the results.
+ *  8. Enforce the stated budget as a hard cap on the candidate pool.
+ *  9. Rank, then filter on the normalised composite score.
  */
 export const retrieveRelevantBooks = async ({
   userId,
   userQuery,
   limit = 5,
+  constraints: providedConstraints,
 }) => {
   const query = String(userQuery || '').trim();
   if (!query) {
@@ -159,8 +172,13 @@ export const retrieveRelevantBooks = async ({
     };
   }
 
-  const constraints = extractPreferenceSignals(query);
-  const { preferredAuthors, budgetMin, budgetMax, preferredGenres } = constraints;
+  // Callers that already analysed the message (assistantchat, via the single
+  // structured LLM call) pass their constraints in rather than paying for a
+  // second, weaker regex extraction here.
+  const constraints = providedConstraints || extractPreferenceSignals(query);
+  const preferredAuthors = constraints.preferredAuthors || [];
+  const preferredGenres = constraints.preferredGenres || [];
+  const { budgetMin, budgetMax } = constraints;
 
   // Run order lookup, user fetch, and query embedding in parallel
   const [orders, user, queryEmbedding] = await Promise.all([
@@ -223,7 +241,57 @@ export const retrieveRelevantBooks = async ({
     }));
   }
 
-  // ── Step 6: Personalized recommendation scoring ────────────────────────
+  // ── Step 6: Budget rescue ─────────────────────────────────────────────
+  // The price filter runs inside the vector search, so an unmeetable budget
+  // ("mystery under Tk 100" against a catalogue that starts at Tk 200) empties
+  // the pool before anything can be flagged, and the user just gets told there
+  // are no matches. Retry unpriced so we can show the closest books and say
+  // outright that they cost more.
+  if (candidates.length === 0 && (isFiniteNumber(budgetMin) || isFiniteNumber(budgetMax))) {
+    const [unpricedAuthorBooks, unpricedSemantic] = await Promise.all([
+      searchByAuthor(preferredAuthors, null, null, excludeBookIds),
+      getUnifiedVectorSearch(queryEmbedding, {}, Math.max(limit * 6, 40)),
+    ]);
+
+    candidates = mergeDeduped(unpricedAuthorBooks, unpricedSemantic)
+      .filter((book) => !excludeBookIds.has(String(book._id)))
+      .filter((book) => book.isAuthorMatch || Number(book.semanticScore ?? 0) >= SEMANTIC_FLOOR)
+      .map((book) => ({ ...book, relevanceScore: Number(book.semanticScore ?? 0) }));
+  }
+
+  // ── Step 7: Hard budget cap ───────────────────────────────────────────
+  // The 10% buffer applied during search is a recall widener for the candidate
+  // pool only. Someone who said "under Tk 300" must not be handed a Tk 330 book
+  // as though it met their limit. Applied before ranking so the ranker still
+  // fills `limit` slots from books that actually qualify.
+  let budgetExceeded = false;
+  if (isFiniteNumber(budgetMin) || isFiniteNumber(budgetMax)) {
+    const withinBudget = (book) => {
+      if (typeof book.price !== 'number') {
+        return true;
+      }
+      if (isFiniteNumber(budgetMax) && book.price > budgetMax) {
+        return false;
+      }
+      if (isFiniteNumber(budgetMin) && book.price < budgetMin) {
+        return false;
+      }
+      return true;
+    };
+
+    const inBudget = candidates.filter(withinBudget);
+
+    if (inBudget.length > 0) {
+      candidates = inBudget;
+    } else if (candidates.length > 0) {
+      // Nothing qualifies. Still answer, but flag every pick so the reply says
+      // outright that it is over budget instead of quietly ignoring the limit.
+      budgetExceeded = true;
+      candidates = candidates.map((book) => ({ ...book, exceedsBudget: true }));
+    }
+  }
+
+  // ── Step 8: Personalized recommendation scoring ────────────────────────
   let finalBooks = candidates;
   if (candidates.length > 0) {
     const historySignals = buildHistorySignals(orders, candidates, user?.feedbackProfile || {});
@@ -266,6 +334,7 @@ export const retrieveRelevantBooks = async ({
     query,
     relevanceThreshold: DEFAULT_RELEVANCE_THRESHOLD,
     semanticFloor: SEMANTIC_FLOOR,
+    budgetExceeded,
     constraints: {
       preferredGenres,
       dislikedGenres: constraints.dislikedGenres || [],

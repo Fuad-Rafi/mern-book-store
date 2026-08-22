@@ -1,4 +1,4 @@
-const KNOWN_GENRES = [
+export const KNOWN_GENRES = [
   'mystery',
   'thriller',
   'romance',
@@ -41,7 +41,7 @@ const normalizeAuthorName = (name = '') => {
     .replace(/\b([a-z])/g, (match) => match.toUpperCase());
 };
 
-const normalizeGenre = (genre) => {
+export const normalizeGenre = (genre) => {
   const value = String(genre || '').toLowerCase().trim();
   if (value === 'sci-fi') {
     return 'science fiction';

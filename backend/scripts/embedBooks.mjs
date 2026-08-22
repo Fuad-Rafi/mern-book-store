@@ -1,10 +1,9 @@
 import mongoose from 'mongoose';
-import { mongoDBURL } from '../config.js';
+import { EMBEDDING_MODEL, mongoDBURL } from '../config.js';
 import Book from '../models/bookmodels.js';
-import * as embeddingService from '../services/embeddingService.js';
-import { upsertBookPoint } from '../services/qdrantService.js';
+import { embedAndSyncBook } from '../services/bookIndexer.js';
 
-const EMBEDDING_MODEL_VERSION = 'Xenova/all-MiniLM-L6-v2';
+const EMBEDDING_MODEL_VERSION = EMBEDDING_MODEL;
 
 const embedBooks = async () => {
   try {
@@ -15,8 +14,17 @@ const embedBooks = async () => {
     await mongoose.connect(mongoDBURL);
     console.log('✅ Connected to MongoDB');
 
-    // Get all books without embeddings
-    const books = await Book.find({ embedding: { $exists: false } });
+    // Books with no vectors at all, plus books embedded before chunking was
+    // persisted (single vector, no chunkEmbeddings) — those need a re-pass.
+    const books = await Book.find({
+      $or: [
+        { embedding: { $exists: false } },
+        { embedding: null },
+        { embedding: { $size: 0 } },
+        { chunkEmbeddings: { $exists: false } },
+        { chunkEmbeddings: { $size: 0 } },
+      ],
+    });
     console.log(`📖 Found ${books.length} books to embed`);
 
     if (books.length === 0) {
@@ -33,48 +41,18 @@ const embedBooks = async () => {
       const book = books[i];
 
       try {
-        // Build search text from book metadata
-        const metadataText = [
-          book.title,
-          book.author,
-          book.genre,
-          ...(Array.isArray(book.tags) ? book.tags : []),
-          ...(Array.isArray(book.themes) ? book.themes : []),
-          ...(Array.isArray(book.subjects) ? book.subjects : []),
-        ]
-          .filter(Boolean)
-          .join(' ');
+        // Shared with the admin create/update routes, so a book embedded here
+        // and a book embedded through the panel end up indexed identically.
+        const result = await embedAndSyncBook(book);
 
-        const synopsisText = book.synopsis || book.description || '';
-        const fullText = `${metadataText}. ${synopsisText}`.trim();
-        
-        const chunks = embeddingService.chunkText(fullText, 200, 40);
-        if (chunks.length === 0) chunks.push(metadataText || book.title);
+        if (!result.embedded) {
+          failedCount++;
+          console.error(`❌ Nothing to embed for "${book.title}" (no title, synopsis or metadata)`);
+          continue;
+        }
 
-        // Generate embeddings for all chunks
-        const chunkEmbeddings = await embeddingService.batchEmbed(chunks);
-        const embedding = chunkEmbeddings[0]; // fallback for Mongo
-
-        // Update book with embedding
-        const updated = await Book.findByIdAndUpdate(
-          book._id,
-          {
-            embedding,
-            semanticMetadata: {
-              embeddedAt: new Date(),
-              modelVersion: EMBEDDING_MODEL_VERSION,
-            },
-          },
-          { new: true }
-        ).lean();
-
-        if (updated && chunkEmbeddings.length > 0) {
-          updated.chunkEmbeddings = chunkEmbeddings;
-          try {
-            await upsertBookPoint(updated);
-          } catch (syncError) {
-            console.warn(`⚠️ Qdrant sync skipped for "${updated.title}": ${syncError.message}`);
-          }
+        if (!result.synced) {
+          console.warn(`⚠️ Qdrant sync skipped for "${book.title}" — run "npm run qdrant:sync" once it is reachable`);
         }
 
         embeddedCount++;

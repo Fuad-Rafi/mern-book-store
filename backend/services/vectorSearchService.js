@@ -6,6 +6,10 @@ import { isQdrantEnabled, searchBookPoints } from './qdrantService.js';
 let lastQdrantFallbackLogAt = 0;
 const QDRANT_FALLBACK_LOG_COOLDOWN_MS = 60 * 1000;
 
+// Search needs the single whole-book `embedding`, never the per-chunk vectors —
+// those are the indexer's business and would multiply every read.
+const WITHOUT_CHUNK_VECTORS = '-chunkEmbeddings';
+
 const logQdrantFallbackError = (error) => {
   const now = Date.now();
   if (now - lastQdrantFallbackLogAt >= QDRANT_FALLBACK_LOG_COOLDOWN_MS) {
@@ -55,7 +59,7 @@ const mongoFallbackSearch = async (queryEmbedding, filters = {}, limit = 20) => 
     }
   }
 
-  const books = await Book.find(query).lean();
+  const books = await Book.find(query).select(WITHOUT_CHUNK_VECTORS).lean();
   if (books.length === 0) {
     return [];
   }
@@ -82,7 +86,9 @@ export const getVectorNearestBooks = async (queryEmbedding, limit = 20) => {
     }
 
     // Fetch all published books with embeddings
-    const books = await Book.find({ embedding: { $exists: true, $ne: null }, isPublished: true }).lean();
+    const books = await Book.find({ embedding: { $exists: true, $ne: null }, isPublished: true })
+      .select(WITHOUT_CHUNK_VECTORS)
+      .lean();
 
     if (books.length === 0) {
       return [];
@@ -163,7 +169,9 @@ export const getUnifiedVectorSearch = async (queryEmbedding, filters = {}, limit
     const idList = vectorHits.map((hit) => hit.id);
     // Second line of defence behind the Qdrant isPublished filter: a point whose
     // payload is stale must still not surface an unpublished book.
-    const books = await Book.find({ _id: { $in: idList }, isPublished: true }).lean();
+    const books = await Book.find({ _id: { $in: idList }, isPublished: true })
+      .select(WITHOUT_CHUNK_VECTORS)
+      .lean();
     const booksById = new Map(books.map((book) => [String(book._id), book]));
 
     const hydrated = vectorHits

@@ -2,16 +2,20 @@ import express from 'express';
 import Book from '../models/bookmodels.js';
 import { authenticateToken, optionalAuthenticateToken, requireRole } from '../middleware/auth.js';
 import { normalizeBookPayload } from '../utils/ragData.js';
-import { deleteBookPoint, upsertBookPoint } from '../services/qdrantService.js';
-import * as embeddingService from '../services/embeddingService.js';
-import { EMBEDDING_MODEL, ENABLE_EMBEDDING_ON_WRITE } from '../config.js';
+import { deleteBookPoint } from '../services/qdrantService.js';
+import { embedAndSyncBook } from '../services/bookIndexer.js';
+import { ENABLE_EMBEDDING_ON_WRITE } from '../config.js';
 import { safeLogError } from '../utils/securityLogger.js';
 
 const router = express.Router();
 const FEATURED_POOL_LIMIT = 11;
 
+// Vector fields are large (384 floats each, one per chunk) and no client needs
+// them. Excluded from every read that returns books over the wire.
+const WITHOUT_VECTORS = '-embedding -chunkEmbeddings';
+
 const getNormalizedFeaturedBooks = async () => {
-    let featuredBooks = await Book.find({ isFeatured: true }).sort({ updatedAt: -1 });
+    let featuredBooks = await Book.find({ isFeatured: true }).select(WITHOUT_VECTORS).sort({ updatedAt: -1 });
 
     // Only trim if over the limit, do NOT auto-refill if under
     if (featuredBooks.length > FEATURED_POOL_LIMIT) {
@@ -69,42 +73,10 @@ const buildBookPayload = (body) => {
     };
 };
 
-const buildEmbeddingText = (book = {}) => {
-    return [
-        book.title,
-        book.author,
-        book.synopsis || book.description || '',
-        book.genre,
-        ...(Array.isArray(book.tags) ? book.tags : []),
-        ...(Array.isArray(book.themes) ? book.themes : []),
-        ...(Array.isArray(book.subjects) ? book.subjects : []),
-    ]
-        .filter(Boolean)
-        .join(' ');
-};
-
-const embedAndSyncBook = async (bookDoc) => {
-    if (!bookDoc) {
-        return;
-    }
-
-    const embeddingText = buildEmbeddingText(bookDoc);
-    const embedding = await embeddingService.embedText(embeddingText);
-
-    bookDoc.embedding = embedding;
-    bookDoc.semanticMetadata = {
-        embeddedAt: new Date(),
-        modelVersion: EMBEDDING_MODEL,
-    };
-
-    await bookDoc.save();
-    await upsertBookPoint(bookDoc);
-};
-
 // route to get all books
 router.get('/', optionalAuthenticateToken, async (req, res) => {
     try {
-        const books = await Book.find({});
+        const books = await Book.find({}).select(WITHOUT_VECTORS);
 
         res.json({
             count: books.length,
@@ -183,7 +155,7 @@ router.post('/:id/unfeature', authenticateToken, requireRole('admin'), async (re
 // route to get one book by ID
 router.get('/:id', optionalAuthenticateToken, async (req, res) => {
     try {
-        const book = await Book.findById(req.params.id);
+        const book = await Book.findById(req.params.id).select(WITHOUT_VECTORS);
         if (!book) {
             return res.status(404).json({ message: 'Book not found' });
         }
@@ -301,12 +273,16 @@ router.post('/', authenticateToken, requireRole('admin'), async (request, respon
 // books added via Admin panel have no vectors. Call this to fix them.
 router.post('/sync-embeddings', authenticateToken, requireRole('admin'), async (req, res) => {
     try {
-        // Find all books that have no embedding or have an empty embedding array
+        // Books with no embedding at all, plus books embedded before chunking was
+        // persisted — those have a single vector and no chunkEmbeddings, so they
+        // still need a pass to build their chunk-level index.
         const booksToSync = await Book.find({
             $or: [
                 { embedding: { $exists: false } },
                 { embedding: null },
                 { embedding: { $size: 0 } },
+                { chunkEmbeddings: { $exists: false } },
+                { chunkEmbeddings: { $size: 0 } },
             ],
         });
 
